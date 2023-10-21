@@ -17,8 +17,8 @@ def forward_diffusion(x, t_curr, t_next, schedule): #only for visualization (wor
     assert (alpha[0] == 1.0) and (beta[0] == 0)
     T = len(alpha) - 1
     #assert T > 10, f"Horizon T={T} is too low!"
-    assert (t_curr >=0) and (t_curr < T)
-    assert t_next > t_curr
+    assert (t_curr >=0) and (t_curr <= T)
+    assert t_next >= t_curr
     assert t_next <= T
     #INPUT ASSERTIONS: END
 
@@ -53,8 +53,8 @@ def reverse_diffusion(ddpm_model, x, t_curr, schedule, cuda=True, onlymean=False
     device = 'cuda' if cuda else 'cpu'
     device = torch.device(device)
     ddpm_model.to_device(device) # model is an object of DDPM class below
-    x_inp = x_inp.to(device)
-    t_curr_inp = t_curr_inp.to(device)
+    #x_inp = x_inp.to(device)
+    #t_curr_inp = t_curr_inp.to(device)
     with torch.no_grad():
         noise_pred = ddpm_model.infer(x_inp, t_curr_inp)
         noise_pred = noise_pred.cpu().numpy()
@@ -115,7 +115,7 @@ def make_schedule(scheme, rvar, start_beta=0, end_beta=0.99, T=500):
 
 class DDPM():
 
-    def __init__(self, schedule, model, weightedloss=False, cuda=True):
+    def __init__(self, schedule, model, weightedloss=True, cuda=True):
         
         #INPUT ASSERTIONS: BEGIN
         assert isinstance(schedule, dict)
@@ -134,17 +134,27 @@ class DDPM():
         self.beta = beta
         self.rvar = rvar
         self.weightedloss = weightedloss
-        assert weightedloss==False, "weightedloss not supported at the moment!"
+        #assert weightedloss==False, "weightedloss not supported at the moment!"
         device = 'cuda' if cuda else 'cpu'
         self.device = torch.device(device)    
         self.model = model.to(self.device)
         self.loss = self.__build_loss().to(self.device)
+        self.loss_weights = self.__get_loss_weights()
     
     
     def __build_loss(self,):
-        return torch.nn.MSELoss(reduction='mean')
-        
-    
+        return torch.nn.MSELoss(reduction='none')
+
+    def __get_loss_weights(self,):
+            
+            t_index = np.arange(start=2, stop=1+self.T, step=1)
+            numer = .5 * np.square(self.beta[t_index])
+            denom = self.rvar[t_index]*(1.0 - self.beta[t_index])*(1.0-self.alpha[t_index])
+            loss_weights = numer/(denom+1e-10)
+            loss_weights = np.asarray([0,0,] + loss_weights.tolist(), dtype=np.float32)
+            return loss_weights
+
+
     def __sample_std_gaussian_noise(self, X): # X is already supposed to be on self.device
 
         return torch.randn(*X.shape, device=self.device, dtype=torch.float32)
@@ -154,17 +164,27 @@ class DDPM():
         num_samples = X0.shape[0]
         
         #SAMPLE T
-        T_curr = np.random.choice(np.arange(start=1, stop=1+self.T, step=1), size=num_samples, replace=True)    
+        start_time_step = 1
+        if self.weightedloss:
+            start_time_step = 2 # This is to ensure non-inf weight for t=1 case
+        T_curr = np.random.choice(np.arange(start=start_time_step, stop=1+self.T, step=1), size=num_samples, replace=True)    
         Alpha_T_curr = self.alpha[T_curr]
+        
+        #GENERATE WEIGHTS FOR LOSS
+        if self.weightedloss:
+            loss_weights = self.loss_weights[T_curr]
+            loss_weights = torch.from_numpy(loss_weights).to(self.device)
+        else:
+            loss_weights = 1.0
+
+        #GENERATE X_T
         p = torch.tensor(np.sqrt(Alpha_T_curr).reshape(-1, *([1]*(len(X0.shape)-1)) ), dtype=torch.float32).to(self.device)
         q = torch.tensor(np.sqrt(1.0-Alpha_T_curr).reshape(-1, *([1]*(len(X0.shape)-1)) ), dtype=torch.float32).to(self.device)
-        
-        #GENERATE X_T
         Noise_std_gaussian = self.__sample_std_gaussian_noise(X0)
         X_T_curr = (p*X0) + (q*Noise_std_gaussian)
         T_curr = torch.from_numpy(np.asarray(T_curr, dtype=np.float32)).to(self.device)
-        
-        return X_T_curr, T_curr, Noise_std_gaussian
+
+        return X_T_curr, T_curr, Noise_std_gaussian, loss_weights
 
     def to_device(self, device):
         self.device = device
@@ -183,10 +203,10 @@ class DDPM():
         
         self.model.train()
         X0 = X0.to(self.device)
-        X_T_curr, T_curr, Noise_std_gaussian = self.__generate_temporal_noise(X0)
+        X_T_curr, T_curr, Noise_std_gaussian, loss_weights = self.__generate_temporal_noise(X0)
         Noise_std_gaussian_pred = self.model(X_T_curr, T_curr)
-        
-        return self.loss(Noise_std_gaussian_pred, Noise_std_gaussian)
+        loss = torch.mean(self.loss(Noise_std_gaussian_pred, Noise_std_gaussian).reshape(X0.shape[0],-1).mean(dim=-1) * loss_weights)
+        return loss
 
 
 
